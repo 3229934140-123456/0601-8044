@@ -1,6 +1,6 @@
 import threading
 import time
-from typing import Deque, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -12,6 +12,8 @@ class _Waiter:
     cond: threading.Condition = field(default_factory=threading.Condition)
     granted: bool = False
     timed_out: bool = False
+    closed_rejected: bool = False   # 被闸门关闭拒绝
+    enqueue_ts_ns: int = 0           # 入队时间（monotonic_ns），用于 inspect 等待时长
 
 
 @dataclass
@@ -19,11 +21,12 @@ class _Stats:
     """可观测统计。所有读写都在 self._lock 保护下。"""
     total_success: int = 0
     total_timeout: int = 0
-    total_wait_ns: int = 0  # 纳秒累计，计算平均值时再转 ms
+    total_closed_rejected: int = 0   # 闸门关闭被拒绝数
+    total_wait_ns: int = 0           # 纳秒累计，计算平均值时再转 ms
 
     @property
     def total_ops(self) -> int:
-        return self.total_success + self.total_timeout
+        return self.total_success + self.total_timeout + self.total_closed_rejected
 
     @property
     def avg_wait_ms(self) -> float:
@@ -42,7 +45,9 @@ class TimedSemaphore:
     - 严格超时边界：时间一到必失败，绝不"捡漏"
     - 非公平小请求绕过：大请求暂时凑不齐时，后面够资源的小请求先通过
     - 动态容量调整：set_capacity / adjust_capacity，不强行收回已借出许可
-    - 可观测统计：累计成功/超时/平均等待时间
+    - 可观测统计：累计成功/超时/关闭拒绝/平均等待时间
+    - 等待视图：inspect_waiters() 看每个等待者所需许可、已等待时长、是否队首
+    - 闸门开关：close()/open() 服务下线/恢复
 
     默认：fair=False（非公平、吞吐更高，类似 Java Semaphore 默认）。
     """
@@ -54,6 +59,8 @@ class TimedSemaphore:
         self._value = value
         self._outstanding = 0          # 实际已借出的许可数（acquire-release 净额）
         self._fair = fair
+        self._closed = False            # 闸门是否关闭（用于服务下线）
+        self._last_closed_rejected = False  # acquire 统计用标志位
         self._lock = threading.Lock()
         self._wait_queue: Deque[_Waiter] = deque()
         self._stats = _Stats()
@@ -87,17 +94,91 @@ class TimedSemaphore:
     def is_fair(self) -> bool:
         return self._fair
 
+    @property
+    def is_closed(self) -> bool:
+        """闸门是否已关闭（新请求将被立即拒绝）。"""
+        with self._lock:
+            return self._closed
+
     def get_stats(self) -> dict:
         """返回当前统计快照。"""
         with self._lock:
             return {
                 "available": self._value,
                 "capacity": self._capacity,
+                "outstanding": self._outstanding,
                 "queue_length": len(self._wait_queue),
                 "total_success": self._stats.total_success,
                 "total_timeout": self._stats.total_timeout,
+                "total_closed_rejected": self._stats.total_closed_rejected,
                 "avg_wait_ms": self._stats.avg_wait_ms,
+                "is_fair": self._fair,
+                "is_closed": self._closed,
             }
+
+    def inspect_waiters(self) -> List[dict]:
+        """
+        批量异步等待视图——返回当前所有等待请求的快照。
+        用于排障：判断是不是大请求堵住了资源池。
+
+        每个元素包含：
+          - permits:         请求的许可数
+          - waited_ms:       已经等了多久（毫秒）
+          - is_head:         是否公平队列的队首（仅 fair=True 时有意义）
+          - granted:         是否已被授予但还没出 acquire
+          - timed_out:       是否已标记超时
+          - closed_rejected: 是否已被闸门关闭标记为拒绝
+
+        注意：返回的是**快照**，与实际状态有时间差，只用于观测，不做判断依据。
+        """
+        now_ns = time.monotonic_ns()
+        with self._lock:
+            q_copy = list(self._wait_queue)
+            out: List[dict] = []
+            for i, w in enumerate(q_copy):
+                waited_ms = 0.0
+                if w.enqueue_ts_ns > 0:
+                    waited_ms = (now_ns - w.enqueue_ts_ns) / 1e6
+                out.append({
+                    "permits": w.permits,
+                    "waited_ms": round(waited_ms, 3),
+                    "is_head": (i == 0),
+                    "granted": w.granted,
+                    "timed_out": w.timed_out,
+                    "closed_rejected": w.closed_rejected,
+                })
+            return out
+
+    # ================================================================
+    # 闸门开关（服务下线/恢复）
+    # ================================================================
+    def close(self) -> None:
+        """
+        关闭闸门：
+          1. 之后所有新的 acquire() 请求立即返回 False（不等待）
+          2. 已在等待队列中的请求被全部唤醒，返回 False
+          3. 已成功获取许可的任务仍然可以正常 release() 归还
+
+        用于服务准备下线时快速"排水"。
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+            # 唤醒所有等待者——标记为"关闭拒绝"
+            for waiter in list(self._wait_queue):
+                if not waiter.granted and not waiter.timed_out:
+                    waiter.closed_rejected = True
+                    with waiter.cond:
+                        waiter.cond.notify()
+            # 清空等待队列（等各线程自己 remove 也可以，但清空更干净）
+            self._wait_queue.clear()
+
+    def open(self) -> None:
+        """重新打开闸门（恢复服务）。关闭期间被拒绝的请求不会自动重试。"""
+        with self._lock:
+            self._closed = False
 
     # ================================================================
     # 动态容量调整
@@ -107,10 +188,21 @@ class TimedSemaphore:
         相对调整容量：delta>0 扩容，delta<0 缩容。
         已借出的许可不会被强行收回。
         - 扩容：立即增加 delta 个可用许可，并尝试唤醒等待者
-        - 缩容：尽量从 available 里扣；不够扣的先把 capacity 标小，后续 release 回来会在缩容时再扣
+        - 缩容：尽量从 available 里扣；后续 release 时若 available 超过 capacity，
+          会自动把超出部分吞掉（确保对齐新容量）
+
+        异常：如果最终 capacity < 0，抛出 ValueError，调整被回滚。
         """
         with self._lock:
-            self._capacity += delta
+            old_cap = self._capacity
+            new_cap = old_cap + delta
+            if new_cap < 0:
+                raise ValueError(
+                    f"adjust_capacity(delta={delta}) would result in capacity={new_cap} < 0, "
+                    f"current borrowed={self._outstanding}. "
+                    f"Rejecting to avoid negative capacity."
+                )
+            self._capacity = new_cap
             if delta > 0:
                 self._value += delta
                 if self._fair:
@@ -124,17 +216,22 @@ class TimedSemaphore:
                 # 不需要唤醒等待者——资源更少了
 
     def set_capacity(self, new_capacity: int) -> None:
-        """设置绝对容量。"""
+        """
+        设置绝对容量。如果 new_capacity < 0 立即抛出 ValueError。
+        缩容时已借出的许可不会被强行收回，但后续归还的许可若超出新 capacity 会被自动吞掉。
+        """
+        if not isinstance(new_capacity, int):
+            raise TypeError(f"capacity must be int, got {type(new_capacity).__name__}")
         if new_capacity < 0:
-            raise ValueError("capacity must be >= 0")
+            raise ValueError(
+                f"set_capacity(new={new_capacity}) rejected: capacity must be >= 0. "
+                f"Note: outstanding borrowed={self._outstanding} will not be force-recalled."
+            )
         with self._lock:
             delta = new_capacity - self._capacity
         if delta != 0:
             self.adjust_capacity(delta)
-        # 额外：缩容后若 available 超过新 capacity，把超出部分一次性吞掉
-        #（防止 release 累积的多余许可）
-        if new_capacity < 0:
-            pass
+        # 额外规整：缩容后若 available 超过新 capacity，把超出部分一次性吞掉
         with self._lock:
             if self._value > self._capacity:
                 self._value = self._capacity
@@ -150,12 +247,15 @@ class TimedSemaphore:
           一旦超时时间到，即使此刻刚好有许可释放，也返回 False。
           不会因为"刚好赶上末班车"而把一个已经超时的请求算成成功。
 
+        闸门关闭语义：
+          如果 close() 过，立即返回 False（不计入超时统计，计入 closed_rejected）。
+
         Args:
             permits: 需要获取的许可数量，必须 >= 1
             timeout: 超时秒数。None 表示无限等待。
 
         Returns:
-            True 表示成功获取 permits 个；False 表示超时，一个都没拿到。
+            True 表示成功获取 permits 个；False 表示失败（超时 / 关闭 / 参数错等）。
         """
         if permits < 1:
             raise ValueError("permits must be >= 1")
@@ -172,13 +272,26 @@ class TimedSemaphore:
                 self._stats.total_success += 1
                 self._outstanding += permits
             else:
-                self._stats.total_timeout += 1
+                # 区分是超时还是关闭拒绝：通过 "waiting for < 0.1ms" 这种启发式无法判断，
+                # 所以在 _do_acquire 返回后用一个标志位
+                if self._last_closed_rejected:
+                    self._stats.total_closed_rejected += 1
+                else:
+                    self._stats.total_timeout += 1
             self._stats.total_wait_ns += wait_ns
+            self._last_closed_rejected = False
 
         return ok
 
     def _do_acquire(self, permits: int, timeout: Optional[float]) -> bool:
         """真实的 acquire 逻辑，不处理统计。"""
+        # 先在持锁下检查关闭——新请求直接拒绝
+        with self._lock:
+            self._last_closed_rejected = False
+            if self._closed:
+                self._last_closed_rejected = True
+                return False
+
         if self._fair:
             return self._acquire_fair(permits, timeout)
         else:
@@ -188,38 +301,48 @@ class TimedSemaphore:
     # 非公平模式：小请求可跳过大请求
     # ----------------------------------------------------------------
     def _acquire_unfair(self, permits: int, timeout: Optional[float]) -> bool:
-        waiter = _Waiter(permits=permits)
+        waiter = _Waiter(permits=permits, enqueue_ts_ns=time.monotonic_ns())
 
         with self._lock:
+            if self._closed:
+                self._last_closed_rejected = True
+                return False
             # 快速路径：资源够，直接拿
             if self._value >= permits:
                 self._value -= permits
                 return True
 
-            # 资源不够，登记到等待列表（非公平：顺序无关）
+            # 资源不够，登记到等待列表
             self._wait_queue.append(waiter)
-
-            # 顺便尝试：看看现有资源能不能先满足某个小请求（可能就是新入队的这个）
-            # 不过因为我们刚确认 _value < permits，而其他等待者也在队列里，
-            # 这次先不尝试，等 release 或超时再统一扫描。
 
         # 进入等待
         got_granted = False
         timed_out = False
+        closed_rej = False
         try:
             if timeout is None:
                 with waiter.cond:
-                    while not waiter.granted and not waiter.timed_out:
+                    while not waiter.granted and not waiter.timed_out and not waiter.closed_rejected:
                         waiter.cond.wait()
                 timed_out = False
             else:
                 deadline = time.monotonic() + timeout
                 remaining = timeout
                 with waiter.cond:
-                    while not waiter.granted and not waiter.timed_out and remaining > 0:
+                    while (not waiter.granted and not waiter.timed_out
+                           and not waiter.closed_rejected and remaining > 0):
                         waiter.cond.wait(timeout=remaining)
                         remaining = deadline - time.monotonic()
-                timed_out = remaining <= 0
+                timed_out = remaining <= 0 and not waiter.granted and not waiter.closed_rejected
+
+            closed_rej = waiter.closed_rejected
+
+            # 关闭拒绝：不归还，因为从未被授予
+            if closed_rej:
+                with self._lock:
+                    self._last_closed_rejected = True
+                    self._remove_waiter(waiter)
+                return False
 
             # 严格超时边界
             if timed_out:
@@ -230,14 +353,13 @@ class TimedSemaphore:
                         self._value += waiter.permits
                         waiter.granted = False
                     self._remove_waiter(waiter)
-                    # 腾出了资源/位置，扫描剩下的等待者看谁能满足
                     self._wake_waiters()
                 return False
 
             got_granted = waiter.granted
             return got_granted
         finally:
-            if not got_granted and not timed_out:
+            if not got_granted and not timed_out and not closed_rej:
                 # 异常路径
                 with self._lock:
                     self._remove_waiter(waiter)
@@ -250,9 +372,12 @@ class TimedSemaphore:
     # 公平模式：FIFO，队首不满足就绝不满足后面的
     # ----------------------------------------------------------------
     def _acquire_fair(self, permits: int, timeout: Optional[float]) -> bool:
-        waiter = _Waiter(permits=permits)
+        waiter = _Waiter(permits=permits, enqueue_ts_ns=time.monotonic_ns())
 
         with self._lock:
+            if self._closed:
+                self._last_closed_rejected = True
+                return False
             self._wait_queue.append(waiter)
             # 尝试立刻满足（只有队首才有资格）
             self._try_grant_fair()
@@ -261,20 +386,30 @@ class TimedSemaphore:
 
         got_granted = False
         timed_out = False
+        closed_rej = False
         try:
             if timeout is None:
                 with waiter.cond:
-                    while not waiter.granted and not waiter.timed_out:
+                    while not waiter.granted and not waiter.timed_out and not waiter.closed_rejected:
                         waiter.cond.wait()
                 timed_out = False
             else:
                 deadline = time.monotonic() + timeout
                 remaining = timeout
                 with waiter.cond:
-                    while not waiter.granted and not waiter.timed_out and remaining > 0:
+                    while (not waiter.granted and not waiter.timed_out
+                           and not waiter.closed_rejected and remaining > 0):
                         waiter.cond.wait(timeout=remaining)
                         remaining = deadline - time.monotonic()
-                timed_out = remaining <= 0
+                timed_out = remaining <= 0 and not waiter.granted and not waiter.closed_rejected
+
+            closed_rej = waiter.closed_rejected
+
+            if closed_rej:
+                with self._lock:
+                    self._last_closed_rejected = True
+                    self._remove_waiter(waiter)
+                return False
 
             if timed_out:
                 with self._lock:
@@ -289,7 +424,7 @@ class TimedSemaphore:
             got_granted = waiter.granted
             return got_granted
         finally:
-            if not got_granted and not timed_out:
+            if not got_granted and not timed_out and not closed_rej:
                 with self._lock:
                     self._remove_waiter(waiter)
                     if waiter.granted:
@@ -316,12 +451,11 @@ class TimedSemaphore:
         if not self._wait_queue:
             return
 
-        # 扫描列表多次（一次扫描可能有新空间腾出来）
         progress = True
         while progress:
             progress = False
-            for waiter in list(self._wait_queue):  # 遍历副本，允许中途 remove
-                if waiter.granted or waiter.timed_out:
+            for waiter in list(self._wait_queue):
+                if waiter.granted or waiter.timed_out or waiter.closed_rejected:
                     continue
                 if self._value >= waiter.permits:
                     self._value -= waiter.permits
@@ -338,6 +472,9 @@ class TimedSemaphore:
         """
         while self._wait_queue and self._value >= self._wait_queue[0].permits:
             head = self._wait_queue[0]
+            if head.closed_rejected:
+                self._wait_queue.popleft()
+                continue
             self._value -= head.permits
             head.granted = True
             self._wait_queue.popleft()
@@ -351,8 +488,8 @@ class TimedSemaphore:
         """
         释放 permits 个许可。
 
-        注意：release 永远不会吞掉许可（避免 TimedSemaphore(0) 后 release(1) 发现许可消失的反直觉行为）。
-        "吞掉超额许可"只在缩容操作 (set_capacity/adjust_capacity) 的瞬间发生。
+        容量对齐：若当前 available + permits > capacity（因之前缩容后有未归还的借出），
+        则归还后自动把超出部分吞掉，确保 available 不会超过 capacity。
         """
         if permits < 1:
             raise ValueError("permits must be >= 1")
@@ -360,6 +497,9 @@ class TimedSemaphore:
         with self._lock:
             self._value += permits
             self._outstanding = max(0, self._outstanding - permits)
+            # ---- 需求2a：缩容后归还自动对齐，不要超过 capacity ----
+            if self._value > self._capacity:
+                self._value = self._capacity
             if self._fair:
                 self._try_grant_fair()
             else:
